@@ -4,7 +4,8 @@ from urllib.parse import quote
 import io
 import gzip
 import re
-import requests
+import redis
+import requests_cache
 from . import topics
 import json
 from datetime import datetime
@@ -36,7 +37,11 @@ import logging
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 
-r_session = requests.Session()
+r_session = requests_cache.CachedSession(
+    backend=requests_cache.RedisCache(connection=redis.StrictRedis.from_url(getattr(settings, 'REDIS_URL'))),
+    cache_name='censusreporter_cache',
+    expire_after=requests_cache.NEVER_EXPIRE,
+)
 r_session.headers.update({'User-Agent': 'censusreporter.org frontend'})
 
 
@@ -326,7 +331,7 @@ class GeographyDetailView(TemplateView):
         pass
 
     def get_geography(self, geo_id):
-        endpoint = f"{settings.API_URL}/1.0/geo/tiger2021/{self.geo_id}"
+        endpoint = f"{settings.API_URL}/1.0/geo/tiger2022/{self.geo_id}"
         r = r_session.get(endpoint)
         status_code = r.status_code
 

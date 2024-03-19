@@ -2,27 +2,16 @@
 
 {% block head_title %}Map View: {{ block.super }}{% endblock %}
 
-{% block head_javascript_extra %}
-<script src='https://api.tiles.mapbox.com/mapbox.js/v2.2.2/mapbox.js'></script>
-{% endblock %}
-
-{% block head_css_extra %}
-<link href='https://api.tiles.mapbox.com/mapbox.js/v1.6.1/mapbox.css' rel='stylesheet' />
-  <!--[if lte IE 8]>
-    <link href='https://api.tiles.mapbox.com/mapbox.js/v1.6.1/mapbox.ie.css' rel='stylesheet' >
-  <![endif]-->
-<link href='{{STATIC_URL}}css/vendor/leaflet.label.css' rel='stylesheet' />
-{% endblock %}
-
 {% block body_class %}{{ block.super }} full-screen{% endblock %}
 
 {% block body %}
+{% load static %}
 <div id="map-controls" class="clearfix">
     <header class="box-header">
         <a class="title" href="{% url 'homepage' %}">
-            <img src="{{ STATIC_URL }}img/logo.png" width="44" height="21" alt="Census Reporter Logo"> Census Reporter
+            <img src="{% static 'img/logo.png' %}" width="44" height="21" alt="Census Reporter Logo"> Census Reporter
         </a>
-    </header> 
+    </header>
     <div class="box-content">
         <section class="clearfix">
             {% include 'data/_blocks/_toggle_menu.html' %}
@@ -40,8 +29,4 @@
     <!-- Add mapbox watermark -->
     <a href="http://mapbox.com/about/maps" class='mapbox-maplogo' target="_blank">MapBox</a>
 </div>
-{% endblock %}
-
-{% block page_specific_javascript %}
-<script src="{{ STATIC_URL }}js/vendor/leaflet.label.js"></script>
 {% endblock %}

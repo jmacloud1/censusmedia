@@ -74,7 +74,8 @@
     </div>
 </article>
 {% endblock %} {% block body_javascript_extra %}{{ block.super }}
-<script src="{{ STATIC_URL }}js/table.detail.js"></script>
+{% load static %}
+<script src="{% static 'js/table.detail.js' %}"></script>
 <script type="text/javascript">
     var table = new Table({
         tableID: '{{ table.table_id }}',

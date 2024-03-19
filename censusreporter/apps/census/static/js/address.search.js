@@ -1,4 +1,3 @@
-L.mapbox.accessToken = 'pk.eyJ1IjoiY2Vuc3VzcmVwb3J0ZXIiLCJhIjoiQV9hS01rQSJ9.wtsn0FwmAdRV7cckopFKkA';
 var GEOCODE_URL = _("https://api.tiles.mapbox.com/v4/geocode/mapbox.places/<%=query%>.json?access_token=<%=token%>&country=us%2Cpr").template()
 var PROXIMITY_GEOCODE_URL = _("https://api.tiles.mapbox.com/v4/geocode/mapbox.places/<%=query%>.json?proximity=<%=lon%>,<%=lat%>&access_token=<%=token%>&country=us%2Cpr").template()
 var REVERSE_GEOCODE_URL = _("https://api.tiles.mapbox.com/v4/geocode/mapbox.places/<%=lng%>,<%=lat%>.json?access_token=<%=token%>&country=us%2Cpr").template()
@@ -14,12 +13,13 @@ var lat = '',
     lng = '',
     address = '',
     point_marker = null,
-    map = null;
-
+    map = null,
+    hoveredStateId = null;
 // prepare spinner
 $('body').append('<div id="body-spinner"></div>');
 var spinnerTarget = document.getElementById('body-spinner');
 spinner = new Spinner();
+
 
 window.onpopstate = function(event) {
     if (event.state) {
@@ -27,21 +27,21 @@ window.onpopstate = function(event) {
         var lng = event.state.lng;
         var address = event.state.address;
         if (lat && lng) {
-            updateLocation(lat, lng, address);
+            updateLocation(new mapboxgl.LngLat(lng, lat), address);
         }
     }
 }
 
-function updateLocation(lat, lng, label) {
+function updateLocation(lngLat, label) {
     if (!label) {
-        reverseGeocode({ lat: lat, lng: lng }, function(label) {
-            updateLocation(lat, lng, label);
+        reverseGeocode(lngLat, function(label) {
+            updateLocation(lngLat, label);
         })
     } else {
-        setMap(lat, lng);
-        findPlaces(lat, lng, label);
-        placeMarker(lat, lng, label);
-        var state = { lat: lat, lng: lng, address: label }
+        map.panTo(lngLat)
+        findPlaces(lngLat, label);
+        placeMarker(lngLat, label);
+        var state = { lat: lngLat.lat, lng: lngLat.lng, address: label }
         if (!(_.isEqual(history.state, state))) {
             history.pushState(state, push_state_title_template(state), push_state_url_template(state));
         }
@@ -69,9 +69,9 @@ var addressSearchEngine = new Bloodhound({
         url: GEOCODE_URL,
         replace: function(url, query) {
             if (window.browser_location) {
-                return PROXIMITY_GEOCODE_URL({ query: encodeURIComponent(query), token: L.mapbox.accessToken, lon: browser_location.coords.longitude, lat: browser_location.coords.latitude })
+                return PROXIMITY_GEOCODE_URL({ query: encodeURIComponent(query), token: MAPBOX_ACCESS_TOKEN, lon: browser_location.coords.longitude, lat: browser_location.coords.latitude })
             } else {
-                return url({ query: query, token: L.mapbox.accessToken });
+                return url({ query: query, token: MAPBOX_ACCESS_TOKEN });
             }
         },
         filter: processGeocoderResults
@@ -94,7 +94,7 @@ function selectAddress(obj, datum) {
             window.selection_error = datum;
             return false
         }
-        updateLocation(lat, lng, label);
+        updateLocation(new mapboxgl.LngLat(lng, lat), label);
     } else {
         console.log("Don't know how to handle selection.");
         window.selection_error = datum;
@@ -146,7 +146,7 @@ if (navigator.geolocation) {
             spinner.stop();
             lat = position.coords.latitude;
             lng = position.coords.longitude;
-            updateLocation(lat, lng)
+            updateLocation(new mapboxgl.LngLat(lng, lat))
         }
 
         function noLocation() {
@@ -161,7 +161,7 @@ if (navigator.geolocation) {
 }
 
 function reverseGeocode(ll, callback) {
-    var url = REVERSE_GEOCODE_URL({ lat: ll.lat, lng: ll.lng, token: L.mapbox.accessToken });
+    var url = REVERSE_GEOCODE_URL({ lat: ll.lat, lng: ll.lng, token: MAPBOX_ACCESS_TOKEN });
     $.getJSON(url, function(data, status) {
         if (status == 'success' && data.features) {
             var results = processGeocoderResults(data);
@@ -177,7 +177,7 @@ function reverseGeocode(ll, callback) {
 
 
 function geocodeAddress(query, callback) {
-    var url = GEOCODE_URL({ query: encodeURIComponent(query), token: L.mapbox.accessToken });
+    var url = GEOCODE_URL({ query: encodeURIComponent(query), token: MAPBOX_ACCESS_TOKEN });
     $.getJSON(url, callback);
 }
 
@@ -190,27 +190,10 @@ var POLYGON_STYLE = {
     "fillOpacity": 0.3,
 }
 
-function makeLayer(d) {
-    var layer = L.geoJson(d.geom, { style: POLYGON_STYLE })
-    layer.bindLabel(d.full_name, { noHide: true, direction: 'auto' });
-    layer.on('mouseover', function() {
-        layer.setStyle({
-            "fillOpacity": 0.5,
-        });
-    });
-    layer.on('mouseout', function() {
-        layer.setStyle(POLYGON_STYLE);
-    });
-    layer.on('click', function() {
-        window.location.href = '/profiles/' + d.full_geoid;
-    });
-    return layer;
-}
-
-function findPlaces(lat, lng, address) {
+function findPlaces(lngLat, address) {
     spinner.spin(spinnerTarget);
     $(".location-list").hide();
-    _(PLACE_LAYERS).each(function(v) { map.removeLayer(v) });
+    // _(PLACE_LAYERS).each(function(v) { map.removeLayer(v) });
 
     if (address) {
         $("#address-search-message").html(address);
@@ -220,8 +203,9 @@ function findPlaces(lat, lng, address) {
         $("#address-search-message").show();
     }
     var has_map = (window.map != null);
-    params = { 'lat': lat, 'lon': lng, 'sumlevs': '010,020,030,040,050,060,140,150,160,250,310,400,500,610,620,795,860,950,960,970', geom: has_map }
+    params = { 'lat': lngLat.lat, 'lon': lngLat.lng, 'sumlevs': '010,020,030,040,050,060,140,150,160,250,310,400,500,610,620,795,860,950,960,970', geom: has_map }
     $.getJSON(geoSearchAPI, params, function(data, status) {
+
         spinner.stop();
         if (status == 'success') {
             window.PLACE_LAYERS = {}
@@ -246,29 +230,24 @@ function findPlaces(lat, lng, address) {
                 d['SUMLEVELS'] = sumlevMap;
                 $(place_template(d)).appendTo(list);
                 if (has_map) {
-                    window.PLACE_LAYERS[d['full_geoid']] =
-                        makeLayer(d);
+                    window.PLACE_LAYERS[d['full_geoid']] = d
                 }
             }
+
             if (has_map) {
+
+
                 $('.location-list li').on('mouseover', function(evt) {
                     var this_layer = $(evt.currentTarget).data('geoid');
-                    _(PLACE_LAYERS).each(function(v, k) {
-                        if (k == this_layer) {
-                            v.addTo(map);
-                        } else {
-                            map.removeLayer(v);
-                        }
-                    });
+                    showLayer(map, this_layer)
                 })
                 $('.zoom-to-layer').click(function(e) {
                     e.stopPropagation();
                     e.preventDefault();
                     var geoid = $(this).parents('li').data('geoid');
                     if (PLACE_LAYERS[geoid]) {
-                        var layer = PLACE_LAYERS[geoid];
-                        layer.addTo(map);
-                        map.fitBounds(layer.getBounds());
+                        fitLayer(map, geoid)
+                        showLayer(map, geoid)
                     }
                 });
 
@@ -280,30 +259,29 @@ function findPlaces(lat, lng, address) {
     })
 }
 
-function placeMarker(lat, lng, label) {
-    // TODO: extract updating address-search-message (nested in labelWithReverse)
-    // to be independent of the presence of a map.
-
+function placeMarker(lngLat, label) {
     if (map) {
         if (point_marker) {
-            point_marker.hideLabel();
-            point_marker.getLabel().setContent(label);
-            point_marker.setLatLng(L.latLng(lat, lng));
+            point_marker.setLngLat(lngLat)
         } else {
-            point_marker = new L.CircleMarker(L.latLng(lat, lng), { fillColor: "#66c2a5", fillOpacity: 1, stroke: false, radius: 5 });
-            map.addLayer(point_marker);
-            point_marker.bindLabel(label, { noHide: true });
+            let marker_svg = document.getElementById('circle-marker')
+            marker_svg.style.display = 'inline'
+            point_marker = new mapboxgl.Marker({
+                element: marker_svg,
+                color: '#66c2a5'
+            })
+                .setLngLat(lngLat)
+                .addTo(map)
         }
-        point_marker.showLabel();
+        showMarkerLabel(lngLat, label)
     }
-
 }
 
-function setMap(lat, lng) {
-    if (map) {
-        var map_center = new L.latLng(lat, lng);
-        map.panTo(map_center);
-    }
+function showMarkerLabel(lngLat, label) {
+    if (lngLat.toArray) { // is it a mapboxgl.LngLat ?
+        lngLat = lngLat.toArray() 
+    } // otherwise assume it already was an array
+    map.getSource('labels-source').setData(labelFeatureCollection(lngLat, label))
 }
 
 function init_from_params(params) {
@@ -314,7 +292,7 @@ function init_from_params(params) {
         lat = parseFloat(lat);
         lng = parseFloat(lng);
         if (!(isNaN(lat) || isNaN(lng))) {
-            updateLocation(lat, lng, address);
+            updateLocation(new mapboxgl.LngLat(lng, lat), address);
         }
     } else if (address) {
         geocodeAddress(address, function(data) {
@@ -334,12 +312,50 @@ if (!(lat && lng)) {
     lng = '-87.67';
 }
 
+function fitLayer(map, geoid) {
+    var layer = PLACE_LAYERS[geoid];
+    map.fitBounds(turf.bbox(layer.geom), {
+        duration: 1500
+    });
+}
+
+function showLayer(map, geoid) {
+    var layer = PLACE_LAYERS[geoid];
+    let feature = turf.feature(layer.geom)
+    feature.properties['full_name'] = layer['full_name']
+    feature.properties['full_geoid'] = layer['full_geoid']
+    let polyfc = turf.featureCollection([feature])
+    map.getSource('polys-source').setData(polyfc)
+}
+
+function labelFeatureCollection(lngLat, label) {
+
+    features = []
+    if (lngLat && label) {
+        let feature = {
+            'type': 'Feature',
+            'properties': {
+                'description': label,
+                'icon': 'theatre'
+            },
+            'geometry': {
+                'type': 'Point',
+                'coordinates': lngLat
+            }
+        }
+        features.push(feature)
+    }
+
+    return turf.featureCollection(features)
+}
+
 function initialize_map() {
-    var map_center = new L.latLng(lat, lng);
-    window.map = L.map('slippy-map', {
-        center: map_center,
+    mapboxgl.accessToken = MAPBOX_ACCESS_TOKEN;
+    window.map = new mapboxgl.Map({
+        container: 'slippy-map',
+        center: [lng, lat],
         zoom: 13,
-        scrollWheelZoom: true,
+        style: 'mapbox://styles/censusreporter/ckfyfj0v707ob19qdo047ndoq',
         zoomControl: false,
         doubleClickZoom: false,
         boxZoom: true,
@@ -348,24 +364,102 @@ function initialize_map() {
         touchZoom: true
     });
 
-    L.tileLayer(
-        'https://{s}.tiles.mapbox.com/styles/v1/censusreporter/ckfyfj0v707ob19qdo047ndoq/tiles/256/{z}/{x}/{y}?access_token=' + L.mapbox.accessToken, {
-            tileSize: 512,
-            zoomOffset: -1,
-            subdomains: 'abcd',
-            detectRetina: true,
-            attribution: '© <a href="https://apps.mapbox.com/feedback/">Mapbox</a> © <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-        }).addTo(map);
-
-    map.addControl(new L.Control.Zoom({
-        position: 'topright'
-    }));
+    map.addControl(new mapboxgl.NavigationControl({
+        showZoom: true,
+        showCompass: false
+    }), 'top-right')
 
     map.on("dblclick", function(evt) {
-        var lat = evt.latlng.lat,
-            lng = evt.latlng.lng;
-        updateLocation(lat, lng);
+        updateLocation(evt.lngLat);
     })
+
+    map.on("load", e => {         // avoid showing marker before map is ready
+        map.addSource('labels-source', {
+            'type': 'geojson',
+            'data': labelFeatureCollection()
+        });
+
+        map.addLayer({
+            'id': 'labels-layer',
+            'type': 'symbol',
+            'source': 'labels-source',
+            'layout': {
+                'text-field': ['get', 'description'],
+                'text-font': ["Lato Bold"], // need to come from Mapbox Studio
+                'text-size': 14,
+                'text-max-width': 20,
+                'text-variable-anchor': ['left', 'bottom', 'top', 'right'],
+                'text-radial-offset': 0.5,
+                'text-justify': 'auto'
+            },
+            'paint': {
+                'text-halo-width': 2,
+                'text-halo-color': 'white',
+                'text-halo-blur': 1
+            }
+        });
+
+        map.addSource('polys-source', {
+            type: 'geojson',
+            data: {
+                type: 'FeatureCollection',
+                features: []
+            },
+            promoteId: 'full_geoid'
+        })
+
+        map.addLayer({
+            id: 'polys-layer-line',
+            type: 'line',
+            source: 'polys-source',
+            paint: {
+                "line-color": "#777",
+                "line-width": 2,
+                "line-opacity": 0.3,
+            }
+        })
+
+        map.addLayer({
+            id: 'polys-layer-fill',
+            type: 'fill',
+            source: 'polys-source',
+            paint: {
+                "fill-color": "#66c2a5",
+                "fill-opacity": 0.3,
+            }
+        })
+
+        init_from_params($.parseParams());
+ 
+    })
+    const popup = new mapboxgl.Popup({
+        closeButton: false,
+        closeOnClick: false
+    });
+
+    map.on('mouseenter', 'polys-layer-fill', (e) => {
+        map.getCanvas().style.cursor = 'pointer';
+        const full_name = e.features[0].properties.full_name
+        popup.setLngLat(e.lngLat).setHTML(full_name).addTo(map);
+    })
+    map.on('mousemove', 'polys-layer-fill', (e) => {
+        map.setPaintProperty('polys-layer-fill', 'fill-opacity', 0.5)
+        popup.setLngLat(e.lngLat)
+    });
+
+    map.on('mouseleave', 'polys-layer-fill', (e) => {
+        map.setPaintProperty('polys-layer-fill', 'fill-opacity', 0.3, { animate: false })
+        map.getCanvas().style.cursor = '';
+        popup.remove()
+    });
+
+    map.on('click', 'polys-layer-fill', (e) => {
+        if (e && e.features && e.features.length > 0) {
+            window.location.href = '/profiles/' + e.features[0].properties.full_geoid;
+
+        }
+    })
+
 }
 var should_show_map = true; // eventually base on viewport or similar
 if (should_show_map) {
@@ -373,4 +467,3 @@ if (should_show_map) {
 } else {
     $("#address-search-content").addClass('no-map')
 }
-init_from_params($.parseParams());

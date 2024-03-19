@@ -1,17 +1,23 @@
 import json
 import math
 import operator
-import requests
+import redis
+import requests_cache
 
 from collections import OrderedDict
 from django.conf import settings
-from requests.packages.urllib3.util import Retry
-from requests.adapters import HTTPAdapter
 from .utils import get_ratio, get_division, SUMMARY_LEVEL_DICT
 
 import logging
 logging.basicConfig()
 logger = logging.getLogger(__name__)
+
+r_session = requests_cache.CachedSession(
+    cache_name='cr_api_cache',
+    backend=requests_cache.RedisCache(connection=redis.StrictRedis.from_url(getattr(settings, 'REDIS_URL'))),
+    expire_after=requests_cache.NEVER_EXPIRE,
+)
+r_session.headers.update({'User-Agent': 'censusreporter.org frontend profile builder'})
 
 class ApiException(Exception):
     pass
@@ -20,14 +26,14 @@ class ApiException(Exception):
 class ApiClient(object):
     def __init__(self, base_url):
         self.base_url = base_url
-        self.retry_session = requests.Session()
-        self.retry_session.mount(self.base_url, HTTPAdapter(
-            max_retries=Retry(total=3, status_forcelist=[503])
-        ))
 
     def _get(self, path, params=None):
-        url = self.base_url + path
-        r = requests.get(url, params=params, headers={'User-Agent': 'censusreporter.org frontend profile builder'})
+        r = r_session.get(
+            url=self.base_url + path,
+            params=params,
+            headers={'User-Agent': 'censusreporter.org frontend profile builder'},
+        )
+
         data = None
         if r.status_code == 200:
             data = r.json(object_pairs_hook=OrderedDict)
@@ -37,10 +43,10 @@ class ApiClient(object):
         return data
 
     def get_parent_geoids(self, geoid):
-        return self._get('/1.0/geo/tiger2021/{}/parents'.format(geoid))
+        return self._get('/1.0/geo/tiger2022/{}/parents'.format(geoid))
 
     def get_geoid_data(self, geoid):
-        return self._get('/1.0/geo/tiger2021/{}'.format(geoid))
+        return self._get('/1.0/geo/tiger2022/{}'.format(geoid))
 
     def get_data(self, table_ids, geo_ids, acs='latest'):
         if isinstance(table_ids, (list, tuple)):
@@ -55,14 +61,20 @@ def _maybe_int(i):
     return int(i) if i else i
 
 def percentify(val):
-    return val * 100
+    try:
+        return val * 100
+    except TypeError:
+        return None # null value
 
 def rateify(val):
     return val * 1000
 
 def moe_add(moe_a, moe_b):
     # From http://www.census.gov/acs/www/Downloads/handbooks/ACSGeneralHandbook.pdf
-    return math.sqrt(moe_a**2 + moe_b**2)
+    try:
+        return math.sqrt(moe_a**2 + moe_b**2)
+    except TypeError:
+        return None
 
 def moe_proportion(numerator, denominator, numerator_moe, denominator_moe):
     # From http://www.census.gov/acs/www/Downloads/handbooks/ACSGeneralHandbook.pdf
@@ -70,14 +82,21 @@ def moe_proportion(numerator, denominator, numerator_moe, denominator_moe):
     proportion = float(numerator) / denominator
     try:
         return math.sqrt(numerator_moe**2 - (proportion**2 * denominator_moe**2)) / float(denominator)
+    except TypeError as e:
+        if numerator_moe is None or denominator_moe is None:
+            return None
+        raise
     except ValueError as e:
         return moe_ratio(numerator, denominator, numerator_moe, denominator_moe)
 
 def moe_ratio(numerator, denominator, numerator_moe, denominator_moe):
     # From http://www.census.gov/acs/www/Downloads/handbooks/ACSGeneralHandbook.pdf
     # "Calculating MOEs for Derived Ratios" A-14 / A-15
-    ratio = float(numerator) / denominator
-    return math.sqrt(numerator_moe**2 + (ratio**2 * denominator_moe**2)) / float(denominator)
+    try:
+        ratio = float(numerator) / denominator
+        return math.sqrt(numerator_moe**2 + (ratio**2 * denominator_moe**2)) / float(denominator)
+    except TypeError:
+        return None
 
 ops = {
     '+': operator.add,
@@ -130,7 +149,10 @@ def value_rpn_calc(data, rpn_string):
                         c = ops[token](a, b)
                         c_moe = moe_proportion(a, b, a_moe, b_moe)
                     numerator = a
-                    numerator_moe = round(a_moe, 1)
+                    try:
+                        numerator_moe = round(a_moe, 1)
+                    except TypeError:
+                        numerator_moe = None
                 else:
                     c = ops[token](a, b)
                     c_moe = moe_ops[token](a_moe, b_moe)
@@ -180,14 +202,19 @@ def build_item(name, data, parents, rpn_string):
 
             if numerator is not None:
                 numerator = round(numerator, 2)
-                numerator_moe = round(numerator_moe, 2)
+                try:
+                    numerator_moe = round(numerator_moe, 2)
+                except TypeError:
+                    numerator_moe = None
 
             val['values'][label] = value
             val['error'][label] = error
             val['numerators'][label] = numerator
             val['numerator_errors'][label] = numerator_moe
         except Exception as e:
-            logger.warn(f'Error fetching {name} for {label} {e}')
+            logger.warn(f'Error fetching {name} for {label} {e}', exc_info=True)
+            if settings.DEBUG:
+                import pdb; pdb.set_trace()
     return val
 
 def add_metadata(dictionary, table_id, universe, acs_release):
@@ -345,40 +372,44 @@ def geo_profile(geoid, acs='latest'):
     age_dict['median_age'] = median_age_dict
 
     # Demographics: Race
-    data = api.get_data('B03002', comparison_geoids, acs)
-    acs_name = data['release']['name']
+    try:
+        race_dict = OrderedDict()
+        doc['demographics']['race'] = race_dict
+        add_metadata(race_dict, 'B03002', 'Total population', acs_name)
 
-    race_dict = OrderedDict()
-    doc['demographics']['race'] = race_dict
-    add_metadata(race_dict, 'B03002', 'Total population', acs_name)
+        data = api.get_data('B03002', comparison_geoids, acs)
+        acs_name = data['release']['name']
 
-    race_dict['percent_white'] = build_item('White', data, item_levels,
-        'B03002003 B03002001 / %')
+        race_dict['percent_white'] = build_item('White', data, item_levels,
+            'B03002003 B03002001 / %')
 
-    race_dict['percent_black'] = build_item('Black', data, item_levels,
-        'B03002004 B03002001 / %')
+        race_dict['percent_black'] = build_item('Black', data, item_levels,
+            'B03002004 B03002001 / %')
 
-    race_dict['percent_native'] = build_item('Native', data, item_levels,
-        'B03002005 B03002001 / %')
+        race_dict['percent_native'] = build_item('Native', data, item_levels,
+            'B03002005 B03002001 / %')
 
-    race_dict['percent_asian'] = build_item('Asian', data, item_levels,
-        'B03002006 B03002001 / %')
+        race_dict['percent_asian'] = build_item('Asian', data, item_levels,
+            'B03002006 B03002001 / %')
 
-    race_dict['percent_islander'] = build_item('Islander', data, item_levels,
-        'B03002007 B03002001 / %')
+        race_dict['percent_islander'] = build_item('Islander', data, item_levels,
+            'B03002007 B03002001 / %')
 
-    race_dict['percent_other'] = build_item('Other', data, item_levels,
-        'B03002008 B03002001 / %')
+        race_dict['percent_other'] = build_item('Other', data, item_levels,
+            'B03002008 B03002001 / %')
 
-    race_dict['percent_two_or_more'] = build_item('Two+', data, item_levels,
-        'B03002009 B03002001 / %')
+        race_dict['percent_two_or_more'] = build_item('Two+', data, item_levels,
+            'B03002009 B03002001 / %')
 
-#    # collapsed version of "other"
-#    race_dict['percent_other'] = build_item('Other', data, item_levels,
-#        'B03002005 B03002007 + B03002008 + B03002009 + B03002001 / %')
+    #    # collapsed version of "other"
+    #    race_dict['percent_other'] = build_item('Other', data, item_levels,
+    #        'B03002005 B03002007 + B03002008 + B03002009 + B03002001 / %')
 
-    race_dict['percent_hispanic'] = build_item('Hispanic', data, item_levels,
-        'B03002012 B03002001 / %')
+        race_dict['percent_hispanic'] = build_item('Hispanic', data, item_levels,
+            'B03002012 B03002001 / %')
+    except Exception as e:
+        logger.info(f"profile [{geoid}]: Exception building Demographics: Race {e}")
+        doc['demographics']['race'] = None
 
     income_dict = dict()
     try:
@@ -479,22 +510,27 @@ def geo_profile(geoid, acs='latest'):
 
 
     # Families: Family Types with Children
-    data = api.get_data('B09002', comparison_geoids, acs)
-    acs_name = data['release']['name']
+    # with the ACS2022-1 year release this was throwing errors because
+    # some PUMAs lacked data in this table
+    # but on closer review, the data doesn't even seem to be used on a profile page
+    # leaving today (2023-09-21) but delete if that turns out true
+    #
+    # data = api.get_data('B09002', comparison_geoids, acs)
+    # acs_name = data['release']['name']
 
-    family_types = dict()
-    doc['families']['family_types'] = family_types
+    # family_types = dict()
+    # doc['families']['family_types'] = family_types
 
-    children_family_type_dict = OrderedDict()
-    family_types['children'] = children_family_type_dict
-    add_metadata(children_family_type_dict, 'B09002', 'Own children under 18 years', acs_name)
+    # children_family_type_dict = OrderedDict()
+    # family_types['children'] = children_family_type_dict
+    # add_metadata(children_family_type_dict, 'B09002', 'Own children under 18 years', acs_name)
 
-    children_family_type_dict['married_couple'] = build_item('Married couple', data, item_levels,
-        'B09002002 B09002001 / %')
-    children_family_type_dict['male_householder'] = build_item('Male householder', data, item_levels,
-        'B09002009 B09002001 / %')
-    children_family_type_dict['female_householder'] = build_item('Female householder', data, item_levels,
-        'B09002015 B09002001 / %')
+    # children_family_type_dict['married_couple'] = build_item('Married couple', data, item_levels,
+    #     'B09002002 B09002001 / %')
+    # children_family_type_dict['male_householder'] = build_item('Male householder', data, item_levels,
+    #     'B09002009 B09002001 / %')
+    # children_family_type_dict['female_householder'] = build_item('Female householder', data, item_levels,
+    #     'B09002015 B09002001 / %')
 
     # Families: Birth Rate by Women's Age
     fertility = dict()
@@ -557,21 +593,24 @@ def geo_profile(geoid, acs='latest'):
         'B25002003 B25002001 / %')
 
     # Housing: Structure Distribution
-    data = api.get_data('B25024', comparison_geoids, acs)
-    acs_name = data['release']['name']
-
     structure_distribution_dict = OrderedDict()
     units_dict['structure_distribution'] = structure_distribution_dict
-    add_metadata(units_dict['structure_distribution'], 'B25024', 'Housing units', acs_name)
+    try:
+        data = api.get_data('B25024', comparison_geoids, acs)
+        acs_name = data['release']['name']
 
-    structure_distribution_dict['single_unit'] = build_item('Single unit', data, item_levels,
-        'B25024002 B25024003 + B25024001 / %')
-    structure_distribution_dict['multi_unit'] = build_item('Multi-unit', data, item_levels,
-        'B25024004 B25024005 + B25024006 + B25024007 + B25024008 + B25024009 + B25024001 / %')
-    structure_distribution_dict['mobile_home'] = build_item('Mobile home', data, item_levels,
-        'B25024010 B25024001 / %')
-    structure_distribution_dict['vehicle'] = build_item('Boat, RV, van, etc.', data, item_levels,
-        'B25024011 B25024001 / %')
+        add_metadata(units_dict['structure_distribution'], 'B25024', 'Housing units', acs_name)
+
+        structure_distribution_dict['single_unit'] = build_item('Single unit', data, item_levels,
+            'B25024002 B25024003 + B25024001 / %')
+        structure_distribution_dict['multi_unit'] = build_item('Multi-unit', data, item_levels,
+            'B25024004 B25024005 + B25024006 + B25024007 + B25024008 + B25024009 + B25024001 / %')
+        structure_distribution_dict['mobile_home'] = build_item('Mobile home', data, item_levels,
+            'B25024010 B25024001 / %')
+        structure_distribution_dict['vehicle'] = build_item('Boat, RV, van, etc.', data, item_levels,
+            'B25024011 B25024001 / %')
+    except Exception as e:
+        logger.info(f"profile [{geoid}]: Exception building Housing: Structure Distribution {e}")
 
     # Housing: Tenure
     data = api.get_data('B25003', comparison_geoids, acs)
@@ -614,30 +653,33 @@ def geo_profile(geoid, acs='latest'):
         ownership_dict['median_value'] = {"name": "Median value of owner-occupied housing units"}
 
 
-    data = api.get_data('B25075', comparison_geoids, acs)
-    acs_name = data['release']['name']
 
     value_distribution = OrderedDict()
     ownership_dict['value_distribution'] = value_distribution
-    add_metadata(value_distribution, 'B25075', 'Owner-occupied housing units', acs_name)
+    try:
+        data = api.get_data('B25075', comparison_geoids, acs)
+        acs_name = data['release']['name']
+        add_metadata(value_distribution, 'B25075', 'Owner-occupied housing units', acs_name)
 
-    ownership_dict['total_value'] = build_item('Total value of owner-occupied housing units', data, item_levels,
-        'B25075001')
+        ownership_dict['total_value'] = build_item('Total value of owner-occupied housing units', data, item_levels,
+            'B25075001')
 
-    value_distribution['under_100'] = build_item('Under $100K', data, item_levels,
-        'B25075002 B25075003 + B25075004 + B25075005 + B25075006 + B25075007 + B25075008 + B25075009 + B25075010 + B25075011 + B25075012 + B25075013 + B25075014 + B25075001 / %')
-    value_distribution['100_to_200'] = build_item('$100K - $200K', data, item_levels,
-        'B25075015 B25075016 + B25075017 + B25075018 + B25075001 / %')
-    value_distribution['200_to_300'] = build_item('$200K - $300K', data, item_levels,
-        'B25075019 B25075020 + B25075001 / %')
-    value_distribution['300_to_400'] = build_item('$300K - $400K', data, item_levels,
-        'B25075021 B25075001 / %')
-    value_distribution['400_to_500'] = build_item('$400K - $500K', data, item_levels,
-        'B25075022 B25075001 / %')
-    value_distribution['500_to_1000000'] = build_item('$500K - $1M', data, item_levels,
-        'B25075023 B25075024 + B25075001 / %')
-    value_distribution['over_1000000'] = build_item('Over $1M', data, item_levels,
-        'B25075025 B25075001 / %')
+        value_distribution['under_100'] = build_item('Under $100K', data, item_levels,
+            'B25075002 B25075003 + B25075004 + B25075005 + B25075006 + B25075007 + B25075008 + B25075009 + B25075010 + B25075011 + B25075012 + B25075013 + B25075014 + B25075001 / %')
+        value_distribution['100_to_200'] = build_item('$100K - $200K', data, item_levels,
+            'B25075015 B25075016 + B25075017 + B25075018 + B25075001 / %')
+        value_distribution['200_to_300'] = build_item('$200K - $300K', data, item_levels,
+            'B25075019 B25075020 + B25075001 / %')
+        value_distribution['300_to_400'] = build_item('$300K - $400K', data, item_levels,
+            'B25075021 B25075001 / %')
+        value_distribution['400_to_500'] = build_item('$400K - $500K', data, item_levels,
+            'B25075022 B25075001 / %')
+        value_distribution['500_to_1000000'] = build_item('$500K - $1M', data, item_levels,
+            'B25075023 B25075024 + B25075001 / %')
+        value_distribution['over_1000000'] = build_item('Over $1M', data, item_levels,
+            'B25075025 B25075001 / %')
+    except Exception as e:
+        logger.info(f"profile [{geoid}]: Exception building Total value of owner-occupied housing units {e}")
 
 
     # Social: Educational Attainment
@@ -694,26 +736,33 @@ def geo_profile(geoid, acs='latest'):
     doc['social']['language'] = language_dict
 
     # Social: Number of Veterans, Wartime Service, Sex of Veterans
-    data = api.get_data('B21002', comparison_geoids, acs)
-    acs_name = data['release']['name']
-
     veterans_dict = dict()
     doc['social']['veterans'] = veterans_dict
 
-    veterans_service_dict = OrderedDict()
-    veterans_dict['wartime_service'] = veterans_service_dict
-    add_metadata(veterans_service_dict, 'B21002', 'Civilian veterans 18 years and over', acs_name)
+    try:
+        data = api.get_data('B21002', comparison_geoids, acs)
+        acs_name = data['release']['name']
 
-    veterans_service_dict['wwii'] = build_item('WWII', data, item_levels,
-        'B21002009 B21002011 + B21002012 +')
-    veterans_service_dict['korea'] = build_item('Korea', data, item_levels,
-        'B21002008 B21002009 + B21002010 + B21002011 +')
-    veterans_service_dict['vietnam'] = build_item('Vietnam', data, item_levels,
-        'B21002004 B21002006 + B21002007 + B21002008 + B21002009 +')
-    veterans_service_dict['gulf_1990s'] = build_item('Gulf (1990s)', data, item_levels,
-        'B21002003 B21002004 + B21002005 + B21002006 +')
-    veterans_service_dict['gulf_2001'] = build_item('Gulf (2001-)', data, item_levels,
-        'B21002002 B21002003 + B21002004 +')
+        veterans_service_dict = OrderedDict()
+        veterans_dict['wartime_service'] = veterans_service_dict
+        add_metadata(veterans_service_dict, 'B21002', 'Civilian veterans 18 years and over', acs_name)
+
+        veterans_service_dict['wwii'] = build_item('WWII', data, item_levels,
+            'B21002009 B21002011 + B21002012 +')
+        veterans_service_dict['korea'] = build_item('Korea', data, item_levels,
+            'B21002008 B21002009 + B21002010 + B21002011 +')
+        veterans_service_dict['vietnam'] = build_item('Vietnam', data, item_levels,
+            'B21002004 B21002006 + B21002007 + B21002008 + B21002009 +')
+        veterans_service_dict['gulf_1990s'] = build_item('Gulf (1990s)', data, item_levels,
+            'B21002003 B21002004 + B21002005 + B21002006 +')
+        veterans_service_dict['gulf_2001'] = build_item('Gulf (2001-)', data, item_levels,
+            'B21002002 B21002003 + B21002004 +')
+    except Exception as e:
+        logger.info(f'profile [{geoid}]: Error fetching wartime service data: {e}')
+        veterans_dict['wartime_service'] = {
+            'name': 'Civilian veterans 18 years and over'
+        }
+
 
     data = api.get_data('B21001', comparison_geoids, acs)
     acs_name = data['release']['name']
@@ -915,7 +964,7 @@ def build_families_fertility_dict(api, acs, item_levels, comparison_geoids):
         'total': None,
         'by_age': None
     }
-    
+
     universe = None
     acs_name = "No data available"
 
@@ -1016,7 +1065,7 @@ def build_housing_migration_dicts(api, acs, item_levels, comparison_geoids):
 
 
 def build_social_language_dict(api, acs, item_levels, comparison_geoids):
-    # TODO: consider refactoring into two methods to produce and return components, and possibly 
+    # TODO: consider refactoring into two methods to produce and return components, and possibly
     # have one succeed where others fail
     # language_adults
     # Social: Percentage of Non-English Spoken at Home, Language Spoken at Home for Children, Adults
@@ -1064,7 +1113,7 @@ def build_social_language_dict(api, acs, item_levels, comparison_geoids):
         'B16007007 B16007002 / %')
     language_adults['other'] = build_item('Other', data, item_levels,
         'B16007013 B16007019 + B16007008 B16007014 + / %')
-    
+
     return language_dict
 
 def build_social_foreign_dict(api, acs, item_levels, comparison_geoids):
@@ -1087,7 +1136,7 @@ def build_social_foreign_dict(api, acs, item_levels, comparison_geoids):
     # Note that minor changes to B05006 will throw this off. We've been bitten thrice.
     # https://github.com/censusreporter/censusreporter/issues/87
     # as of 2020, we don't need a conditional, but it's possible we'll have a period
-    # where we have to check data['release']['name'] or something similar to 
+    # where we have to check data['release']['name'] or something similar to
     # set different numerator columns for these items.
     place_of_birth_dict['europe'] = build_item('Europe', data, item_levels,
         'B05006002 B05006001 / %')

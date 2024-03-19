@@ -7,14 +7,25 @@ WSGI_APPLICATION = "censusreporter.config.prod.wsgi.application"
 
 ALLOWED_HOSTS = ['*']
 
+REDIS_URL = os.environ.get('REDIS_URL', '')
+
 CACHES = {
+    # # Redis cache configuration
+    # 'default': {
+    #     'BACKEND': 'redis_cache.RedisCache',
+    #     'LOCATION': REDIS_URL,
+    #     'TIMEOUT': None,
+    #     # This library defaults to using db 1, and I want it in db 0
+    #     'OPTIONS': {
+    #         'DB': 0,
+    #     },
+    # }
+
+    # Filesystem cache configuration
     'default': {
-        'BACKEND': 'redis_cache.RedisCache',
-        'LOCATION': os.environ.get('REDIS_URL', ''),
+        'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
+        'LOCATION': '/tmp/censusreporter_cache',
         'TIMEOUT': None,
-        # This library defaults to using db 1, and I want it in db 0
-        'OPTIONS': {
-            'DB': 0,
-        },
+        'MAX_ENTRIES': 1_000_000,
     }
 }
